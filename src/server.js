@@ -315,7 +315,7 @@ export class Server extends EventEmitter {
                 }
 
                 if (funcResult && funcResult.headersCustomizer) {
-                    funcResult.headersCustomizer(req.headers);
+                    funcResult.headersCustomizer(request.headers);
                 }
 
                 if (handlerOpts.upstreamProxyUrlParsed) {
