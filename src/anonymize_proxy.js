@@ -9,11 +9,13 @@ const anonymizedProxyUrlToServer = {};
  * Parses and validates a HTTP proxy URL. If the proxy requires authentication, then the function
  * starts an open local proxy server that forwards to the upstream proxy.
  * @param proxyUrl
+ * @param opt Additional options (headersCustomizer is supported only now)
  * @param callback Optional callback that receives the anonymous proxy URL
  * @return If no callback was supplied, returns a promise that resolves to a String with
  * anonymous proxy URL or the original URL if it was already anonymous.
  */
-export const anonymizeProxy = (proxyUrl, callback) => {
+export const anonymizeProxy = (proxyUrl, opt, callback) => {
+    opt = opt || {};
     const parsedProxyUrl = parseUrl(proxyUrl);
     if (!parsedProxyUrl.host || !parsedProxyUrl.port) {
         throw new Error('Invalid "proxyUrl" option: the URL must contain both hostname and port.');
@@ -42,6 +44,7 @@ export const anonymizeProxy = (proxyUrl, callback) => {
                     port,
                     prepareRequestFunction: () => {
                         return {
+                            headersCustomizer: opt.headersCustomizer,
                             requestAuthentication: false,
                             upstreamProxyUrl: proxyUrl,
                         };

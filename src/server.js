@@ -314,6 +314,10 @@ export class Server extends EventEmitter {
                     }
                 }
 
+                if (funcResult && funcResult.headersCustomizer) {
+                    funcResult.headersCustomizer(req.headers);
+                }
+
                 if (handlerOpts.upstreamProxyUrlParsed) {
                     this.log(handlerOpts.id, `Using upstream proxy ${redactParsedUrl(handlerOpts.upstreamProxyUrlParsed)}`);
                 }
