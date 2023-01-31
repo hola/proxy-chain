@@ -11,6 +11,7 @@ const anonymizedProxyUrlToServer: Record<string, Server> = {};
 export interface AnonymizeProxyOptions {
     url: string;
     port: number;
+    headersCustomizer: any | null;
 }
 
 /**
@@ -58,6 +59,8 @@ export const anonymizeProxy = (
                 port,
                 prepareRequestFunction: () => {
                     return {
+			headersCustomizer: typeof options==='string' ? null :
+		            options.headersCustomizer,
                         requestAuthentication: false,
                         upstreamProxyUrl: proxyUrl,
                     };

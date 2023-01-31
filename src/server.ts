@@ -48,6 +48,7 @@ type HandlerOpts = {
     upstreamProxyUrlParsed: URL | null;
     isHttp: boolean;
     customResponseFunction?: CustomResponseOpts['customResponseFunction'] | null;
+    headersCustomizer?: any;
     customConnectServer?: http.Server | null;
     localAddress?: string;
     ipFamily?: number;
@@ -66,6 +67,7 @@ export type PrepareRequestFunctionOpts = {
 
 export type PrepareRequestFunctionResult = {
     customResponseFunction?: CustomResponseOpts['customResponseFunction'];
+    headersCustomizer?: any;
     customConnectServer?: http.Server | null;
     requestAuthentication?: boolean;
     failMsg?: string;
@@ -448,6 +450,10 @@ export class Server extends EventEmitter {
                 throw new Error('The "customResponseFunction" option must be a function.');
             }
         }
+
+	if (funcResult.headersCustomizer) {
+	    handlerOpts.headersCustomizer = funcResult.headersCustomizer;
+	}
 
         if (handlerOpts.upstreamProxyUrlParsed) {
             this.log(proxyChainId, `Using upstream proxy ${redactUrl(handlerOpts.upstreamProxyUrlParsed)}`);

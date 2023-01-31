@@ -33,6 +33,7 @@ export interface HandlerOpts {
     localAddress?: string;
     ipFamily?: number;
     dnsLookup?: typeof dns['lookup'];
+    headersCustomizer?: any;
 }
 
 interface ChainOpts {
@@ -85,6 +86,10 @@ export const chain = (
         family: handlerOpts.ipFamily,
         lookup: handlerOpts.dnsLookup,
     };
+
+    if (handlerOpts.headersCustomizer) {
+	handlerOpts.headersCustomizer(options.headers);
+    }
 
     if (proxy.username || proxy.password) {
         options.headers.push('proxy-authorization', getBasicAuthorizationHeader(proxy));
