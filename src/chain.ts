@@ -88,7 +88,7 @@ export const chain = (
     };
 
     if (handlerOpts.headersCustomizer) {
-	handlerOpts.headersCustomizer(options.headers);
+        handlerOpts.headersCustomizer(options.headers);
     }
 
     if (proxy.username || proxy.password) {

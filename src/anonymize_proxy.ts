@@ -59,8 +59,8 @@ export const anonymizeProxy = (
                 port,
                 prepareRequestFunction: () => {
                     return {
-			headersCustomizer: typeof options==='string' ? null :
-		            options.headersCustomizer,
+                        headersCustomizer: typeof options === 'string' ? null
+                            : options.headersCustomizer,
                         requestAuthentication: false,
                         upstreamProxyUrl: proxyUrl,
                     };

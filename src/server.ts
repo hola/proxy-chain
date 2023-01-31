@@ -451,9 +451,9 @@ export class Server extends EventEmitter {
             }
         }
 
-	if (funcResult.headersCustomizer) {
-	    handlerOpts.headersCustomizer = funcResult.headersCustomizer;
-	}
+        if (funcResult.headersCustomizer) {
+            handlerOpts.headersCustomizer = funcResult.headersCustomizer;
+        }
 
         if (handlerOpts.upstreamProxyUrlParsed) {
             this.log(proxyChainId, `Using upstream proxy ${redactUrl(handlerOpts.upstreamProxyUrlParsed)}`);
