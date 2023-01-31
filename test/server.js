@@ -1,30 +1,29 @@
-import fs from 'fs';
-import path from 'path';
-import stream from 'stream';
-import childProcess from 'child_process';
-import dns from 'dns';
-import _ from 'underscore';
-import { expect, assert } from 'chai';
-import proxy from 'proxy';
-import http from 'http';
-import portastic from 'portastic';
-import Promise from 'bluebird';
-import request from 'request';
-import WebSocket from 'ws';
-import url from 'url';
-import HttpsProxyAgent from 'https-proxy-agent';
+const fs = require('fs');
+const zlib = require('zlib');
+const path = require('path');
+const stream = require('stream');
+const childProcess = require('child_process');
+const net = require('net');
+const dns = require('dns');
+const util = require('util');
+const { expect, assert } = require('chai');
+const proxy = require('proxy');
+const http = require('http');
+const portastic = require('portastic');
+const request = require('request');
+const WebSocket = require('faye-websocket');
+const { gotScraping } = require('got-scraping');
 
-import { parseUrl, parseProxyAuthorizationHeader } from '../build/tools';
-import { Server, RequestError } from '../build/server';
-import { TargetServer } from './target_server';
-
-/* globals process */
+const { parseAuthorizationHeader } = require('../src/utils/parse_authorization_header');
+const { Server, RequestError } = require('../src/index');
+const { TargetServer } = require('./utils/target_server');
+const ProxyChain = require('../src/index');
 
 /*
 TODO - add following tests:
 - gzip Content-Encoding
-- websockets - direct SSL connection
 - IPv6 !!!
+- raw TCP connection over proxy
 - HandlerForward when connected through shader proxy threw error if source socket was closed instead of response, test why.
 */
 
@@ -37,7 +36,7 @@ const sslCrt = fs.readFileSync(path.join(__dirname, 'ssl.crt'));
 // Enable self-signed certificates
 process.env.NODE_TLS_REJECT_UNAUTHORIZED = '0';
 
-const NON_EXISTENT_HOSTNAME = 'non-existent-hostname';
+const NON_EXISTENT_HOSTNAME = 'this-apify-hostname-is-surely-non-existent.cz';
 
 // Prepare testing data
 const DATA_CHUNKS = [];
@@ -45,7 +44,7 @@ let DATA_CHUNKS_COMBINED = '';
 const chars = 'ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789';
 for (let i = 0; i < 100; i++) {
     let chunk = '';
-    for (let i = 0; i < 10000; i++) {
+    for (let j = 0; j < 10000; j++) {
         chunk += chars.charAt(Math.floor(Math.random() * chars.length));
     }
     DATA_CHUNKS.push(chunk);
@@ -56,12 +55,8 @@ const AUTH_REALM = 'Test Proxy'; // Test space in realm string
 
 const requestPromised = (opts) => {
     return new Promise((resolve, reject) => {
-        const result = request(opts, (error, response, body) => {
+        request(opts, (error, response, body) => {
             if (error) {
-                /* console.log('REQUEST');
-                console.dir(response);
-                console.dir(body);
-                console.dir(result); */
                 return reject(error);
             }
             resolve(response, body);
@@ -69,35 +64,67 @@ const requestPromised = (opts) => {
     });
 };
 
-const wait = timeout => new Promise(resolve => setTimeout(resolve, timeout));
+const wait = (timeout) => new Promise((resolve) => setTimeout(resolve, timeout));
 
-// Opens web page in phantomjs and returns the HTML content
-const phantomGet = (url, proxyUrl) => {
-    const phantomPath = path.join(__dirname, '../node_modules/.bin/phantomjs');
-    const scriptPath = path.join(__dirname, './phantom_get.js');
+// Opens web page in puppeteer and returns the HTML content
+const puppeteerGet = (url, proxyUrl) => {
+    // eslint-disable-next-line global-require
+    const puppeteer = require('puppeteer');
 
-    let proxyParams = '';
-    if (proxyUrl) {
-        const parsed = parseUrl(proxyUrl);
-        proxyParams += `--proxy-type=http --proxy=${parsed.hostname}:${parsed.port} `;
-        if (parsed.username || parsed.password) {
-            if ((parsed.username && !parsed.password) || (!parsed.username && parsed.password)) {
-                throw new Error('PhantomJS cannot handle proxy only username or password!');
+    return (async () => {
+        const parsed = proxyUrl ? new URL(proxyUrl) : undefined;
+
+        const browser = await puppeteer.launch({
+            env: parsed ? {
+                HTTP_PROXY: parsed.origin,
+            } : {},
+            ignoreHTTPSErrors: true,
+        });
+
+        try {
+            const page = await browser.newPage();
+
+            if (parsed) {
+                await page.authenticate({
+                    username: decodeURIComponent(parsed.username),
+                    password: decodeURIComponent(parsed.password),
+                });
             }
-            proxyParams += `--proxy-auth=${parsed.username}:${parsed.password} `;
+
+            const response = await page.goto(url);
+            const text = await response.text();
+
+            return text;
+        } finally {
+            await browser.close();
         }
-    }
+    })();
+};
+
+// Opens web page in curl and returns the HTML content.
+// The thing is, on error curl closes the connection immediately, which used to cause
+// uncaught ECONNRESET error. See https://github.com/apify/proxy-chain/issues/53
+// This is a regression test for that situation
+const curlGet = (url, proxyUrl, returnResponse) => {
+    let cmd = 'curl --insecure '; // ignore SSL errors
+    if (proxyUrl) cmd += `-x ${proxyUrl} `; // use proxy
+    if (returnResponse) cmd += `--silent --output - ${url}`; // print response to stdout
+    else cmd += `${url}`;
+    // console.log(`curlGet(): ${cmd}`);
 
     return new Promise((resolve, reject) => {
-        const cmd = `${phantomPath} --ignore-ssl-errors=true ${proxyParams} ${scriptPath} ${url}`;
         childProcess.exec(cmd, (error, stdout, stderr) => {
-            if (error) return reject(new Error(`Cannot open page in PhantomJS: ${error}: ${stderr || stdout}`));
-
-            resolve(stdout);
+            // NOTE: It's okay if curl exits with non-zero code, that happens e.g. on 407 error over HTTPS
+            resolve(stderr || stdout);
         });
     });
 };
 
+/**
+ * This function creates a function to test the proxy, with specific configuration options.
+ * This is to avoid duplication of the code, since many of the tests are same for the specific configurations.
+ * @return {function(...[*]=)}
+ */
 const createTestSuite = ({
     useSsl, useMainProxy, mainProxyAuth, useUpstreamProxy, upstreamProxyAuth, testCustomResponse,
 }) => {
@@ -107,11 +134,12 @@ const createTestSuite = ({
         let freePorts;
 
         let targetServerPort;
-        let targetServerWsPort;
         let targetServer;
 
         let upstreamProxyServer;
         let upstreamProxyPort;
+        // eslint is dumb
+        // eslint-disable-next-line no-unused-vars
         let upstreamProxyWasCalled = false;
         let upstreamProxyRequestCount = 0;
 
@@ -119,10 +147,14 @@ const createTestSuite = ({
         let mainProxyServerStatisticsInterval;
         const mainProxyServerConnections = {};
         let mainProxyServerPort;
+        // eslint is dumb
+        // eslint-disable-next-line no-unused-vars
         const mainProxyRequestCount = 0;
         const mainProxyServerConnectionIds = [];
         const mainProxyServerConnectionsClosed = [];
         const mainProxyServerConnectionId2Stats = {};
+
+        let upstreamProxyHostname = '127.0.0.1';
 
         let baseUrl;
         let mainProxyUrl;
@@ -144,9 +176,8 @@ const createTestSuite = ({
 
                 // Setup target HTTP server
                 targetServerPort = freePorts.shift();
-                targetServerWsPort = freePorts.shift();
                 targetServer = new TargetServer({
-                    port: targetServerPort, wsPort: targetServerWsPort, useSsl, sslKey, sslCrt,
+                    port: targetServerPort, useSsl, sslKey, sslCrt,
                 });
                 return targetServer.listen();
             }).then(() => {
@@ -174,10 +205,10 @@ const createTestSuite = ({
                                 return fn(null, false);
                             }
 
-                            const parsed = parseProxyAuthorizationHeader(auth);
-                            const isEqual = _.isEqual(parsed, upstreamProxyAuth);
+                            const parsed = parseAuthorizationHeader(auth);
+                            const isEqual = ['type', 'username', 'password'].every((name) => parsed[name] === upstreamProxyAuth[name]);
                             // console.log('Parsed "Proxy-Authorization": parsed: %j expected: %j : %s', parsed, upstreamProxyAuth, isEqual);
-                            if (isEqual) upstreamProxyWasCalled = true;
+                            if (upstreamProxyAuth === null || isEqual) upstreamProxyWasCalled = true;
                             fn(null, isEqual);
                         };
 
@@ -191,6 +222,16 @@ const createTestSuite = ({
                         upstreamProxyServer.listen(upstreamProxyPort, (err) => {
                             if (err) return reject(err);
                             resolve();
+                        });
+
+                        // This is a workaround to a buggy implementation of "proxy" package. On Node 10+,
+                        // the socket sometimes emits ECONNRESET error, which would break the test.
+                        // We just swallow it.
+                        upstreamProxyServer.on('connect', (req, socket) => {
+                            socket.on('error', (err) => {
+                                if (err.code === 'ECONNRESET') return;
+                                throw err;
+                            });
                         });
                     });
                 }
@@ -218,27 +259,40 @@ const createTestSuite = ({
                             expect(request).to.be.an('object');
                             expect(port).to.be.an('number');
 
-                            if (hostname === 'activate-error-in-prep-req-func-throw') {
+                            // All the fake hostnames here have a .gov TLD, because without a TLD,
+                            // the tests would fail on GitHub Actions. We assume nobody will register
+                            // those random domains with a .gov TLD.
+                            if (hostname === 'activate-error-in-prep-req-func-throw.gov') {
                                 throw new Error('Testing error 1');
                             }
-                            if (hostname === 'activate-error-in-prep-req-func-throw-known') {
+                            if (hostname === 'activate-error-in-prep-req-func-throw-known.gov') {
                                 throw new RequestError('Known error 1', 501);
                             }
 
-                            if (hostname === 'activate-error-in-prep-req-func-promise') {
+                            if (hostname === 'activate-error-in-prep-req-func-promise.gov') {
                                 return Promise.reject(new Error('Testing error 2'));
                             }
-                            if (hostname === 'activate-error-in-prep-req-func-promise-known') {
+                            if (hostname === 'activate-error-in-prep-req-func-promise-known.gov') {
                                 throw new RequestError('Known error 2', 501);
                             }
 
-                            if (hostname === 'test-custom-response-simple') {
+                            if (hostname === 'test-custom-response-buffer.gov') {
                                 result.customResponseFunction = () => {
-                                    const trgParsed = parseUrl(request.url);
-                                    expect(trgParsed).to.deep.include({
-                                        host: hostname,
-                                        path: '/some/path'
-                                    });
+                                    return {
+                                        statusCode: 200,
+                                        headers: {
+                                            'content-encoding': 'gzip',
+                                        },
+                                        body: zlib.gzipSync('Hello, world!'),
+                                    };
+                                };
+                            }
+
+                            if (hostname === 'test-custom-response-simple.gov') {
+                                result.customResponseFunction = () => {
+                                    const trgParsed = new URL(request.url);
+                                    expect(trgParsed.host).to.be.eql(hostname);
+                                    expect(trgParsed.pathname).to.be.eql('/some/path');
                                     return {
                                         body: 'TEST CUSTOM RESPONSE SIMPLE',
                                     };
@@ -248,13 +302,12 @@ const createTestSuite = ({
                                 if (useSsl) addToMainProxyServerConnectionIds = false;
                             }
 
-                            if (hostname === 'test-custom-response-complex') {
+                            if (hostname === 'test-custom-response-complex.gov') {
                                 result.customResponseFunction = () => {
-                                    const trgParsed = parseUrl(request.url);
-                                    expect(trgParsed).to.deep.include({
-                                        hostname,
-                                        path: '/some/path?query=456',
-                                    });
+                                    const trgParsed = new URL(request.url);
+                                    expect(trgParsed.hostname).to.be.eql(hostname);
+                                    expect(trgParsed.pathname).to.be.eql('/some/path');
+                                    expect(trgParsed.search).to.be.eql('?query=456');
                                     expect(port).to.be.eql(1234);
                                     return {
                                         statusCode: 201,
@@ -267,26 +320,22 @@ const createTestSuite = ({
                                 };
                             }
 
-                            if (hostname === 'test-custom-response-long') {
+                            if (hostname === 'test-custom-response-long.gov') {
                                 result.customResponseFunction = () => {
-                                    const trgParsed = parseUrl(request.url);
-                                    expect(trgParsed).to.deep.include({
-                                        host: hostname,
-                                        path: '/'
-                                    });
+                                    const trgParsed = new URL(request.url);
+                                    expect(trgParsed.host).to.be.eql(hostname);
+                                    expect(trgParsed.pathname).to.be.eql('/');
                                     return {
                                         body: 'X'.repeat(5000000),
                                     };
                                 };
                             }
 
-                            if (hostname === 'test-custom-response-promised') {
+                            if (hostname === 'test-custom-response-promised.gov') {
                                 result.customResponseFunction = () => {
-                                    const trgParsed = parseUrl(request.url);
-                                    expect(trgParsed).to.deep.include({
-                                        host: hostname,
-                                        path: '/some/path'
-                                    });
+                                    const trgParsed = new URL(request.url);
+                                    expect(trgParsed.host).to.be.eql(hostname);
+                                    expect(trgParsed.pathname).to.be.eql('/some/path');
                                     return Promise.resolve().then(() => {
                                         return {
                                             body: 'TEST CUSTOM RESPONSE PROMISED',
@@ -295,31 +344,48 @@ const createTestSuite = ({
                                 };
                             }
 
-                            if (hostname === 'test-custom-response-invalid') {
+                            if (hostname === 'test-custom-response-invalid.gov') {
                                 result.customResponseFunction = 'THIS IS NOT A FUNCTION';
                                 addToMainProxyServerConnectionIds = false;
                             }
 
                             if (mainProxyAuth) {
-                                if (mainProxyAuth.username !== username || mainProxyAuth.password !== password) {
+                                const authDoesNotMatch = mainProxyAuth.username !== username || mainProxyAuth.password !== password;
+                                const nopassword = username === 'nopassword' && password === '';
+                                if (authDoesNotMatch && !nopassword) {
                                     result.requestAuthentication = true;
                                     addToMainProxyServerConnectionIds = false;
-                                    // Now that authentication is requested, upstream proxy should not get used to try some invalid one
-                                    result.upstreamProxyUrl = 'http://dummy-hostname:4567';
+                                    // Now that authentication is requested, upstream proxy should not get used,
+                                    // so try some invalid one and it should cause no issue
+                                    result.upstreamProxyUrl = 'http://dummy-hostname-xyz.gov:6789';
                                 }
                             }
 
                             if (useUpstreamProxy && !result.upstreamProxyUrl) {
                                 let upstreamProxyUrl;
 
-                                if (hostname === 'activate-invalid-upstream-proxy-credentials') {
+                                if (hostname === 'activate-invalid-upstream-proxy-scheme.gov') {
+                                    upstreamProxyUrl = 'ftp://proxy.example.com:8000';
+                                    addToMainProxyServerConnectionIds = false;
+                                } else if (hostname === 'activate-invalid-upstream-proxy-url.gov') {
+                                    upstreamProxyUrl = '    ';
+                                    addToMainProxyServerConnectionIds = false;
+                                } else if (hostname === 'activate-invalid-upstream-proxy-username') {
+                                    // Colon in proxy username is forbidden!
+                                    upstreamProxyUrl = 'http://us%3Aer:pass@proxy.example.com:8000';
+                                    addToMainProxyServerConnectionIds = false;
+                                } else if (hostname === 'activate-bad-upstream-proxy-credentials.gov') {
                                     upstreamProxyUrl = `http://invalid:credentials@127.0.0.1:${upstreamProxyPort}`;
-                                } else if (hostname === 'activate-invalid-upstream-proxy-host') {
-                                    upstreamProxyUrl = 'http://dummy-hostname:1234';
+                                } else if (hostname === 'activate-unknown-upstream-proxy-host.gov') {
+                                    upstreamProxyUrl = 'http://dummy-hostname.gov:1234';
                                 } else {
                                     let auth = '';
-                                    if (upstreamProxyAuth) auth = `${upstreamProxyAuth.username}:${upstreamProxyAuth.password}@`;
-                                    upstreamProxyUrl = `http://${auth}127.0.0.1:${upstreamProxyPort}`;
+                                    // NOTE: We URI-encode just username, not password, which might contain
+                                    if (upstreamProxyAuth) {
+                                        auth = `${encodeURIComponent(upstreamProxyAuth.username)}:${encodeURIComponent(upstreamProxyAuth.password)}@`;
+                                    }
+
+                                    upstreamProxyUrl = `http://${auth}${upstreamProxyHostname}:${upstreamProxyPort}`;
                                 }
 
                                 result.upstreamProxyUrl = upstreamProxyUrl;
@@ -345,7 +411,7 @@ const createTestSuite = ({
                     mainProxyServer = new Server(opts);
 
                     mainProxyServer.on('connectionClosed', ({ connectionId, stats }) => {
-                        assert.include(mainProxyServer.getConnectionIds(), connectionId.toString());
+                        assert.include(mainProxyServer.getConnectionIds(), connectionId);
                         mainProxyServerConnectionsClosed.push(connectionId);
                         const index = mainProxyServerConnectionIds.indexOf(connectionId);
                         mainProxyServerConnectionIds.splice(index, 1);
@@ -358,6 +424,12 @@ const createTestSuite = ({
                 .then(() => {
                     // Generate URLs
                     baseUrl = `${useSsl ? 'https' : 'http'}://127.0.0.1:${targetServerPort}`;
+
+                    // Ensure the port numbers are correct
+                    if (mainProxyServer) {
+                        expect(mainProxyServer.port).to.be.eql(mainProxyServerPort);
+                        expect(mainProxyServer.server.address().port).to.be.eql(mainProxyServerPort);
+                    }
 
                     if (useMainProxy) {
                         let auth = '';
@@ -388,12 +460,15 @@ const createTestSuite = ({
                     assert.fail();
                 })
                     .catch((err) => {
-                        // console.dir(err);
-                        expect(err.message).to.contain(`${expectedStatusCode}`);
+                        expect(err.message.slice(-3)).to.contain(`${expectedStatusCode}`);
+                    })
+                    .finally(() => {
+                        mainProxyServer.removeListener('requestFailed', onRequestFailed);
                     });
             }
             return promise.then((response) => {
                 expect(response.statusCode).to.eql(expectedStatusCode);
+                expect(response.headers['content-type']).to.eql('text/plain; charset=utf-8');
                 if (expectedStatusCode === 500) {
                     expect(requestError).to.have.own.property('message');
                     expect(failedRequest).to.have.own.property('url');
@@ -403,23 +478,96 @@ const createTestSuite = ({
                 }
                 return response;
             })
-            .finally(() => {
-                mainProxyServer.removeListener('requestFailed', onRequestFailed);
-            });
+                .finally(() => {
+                    mainProxyServer.removeListener('requestFailed', onRequestFailed);
+                });
         };
 
         // Replacement for it() that checks whether the tests really called the main and upstream proxies
+        // Only use this for requests that are supposed to go through, e.g. not invalid credentials
+        // eslint-disable-next-line no-underscore-dangle
         const _it = (description, func) => {
             it(description, () => {
                 const upstreamCount = upstreamProxyRequestCount;
                 const mainCount = mainProxyServer ? mainProxyServer.stats.connectRequestCount + mainProxyServer.stats.httpRequestCount : null;
                 return func()
                     .then(() => {
-                        if (useMainProxy) expect(mainCount).to.be.below(mainProxyServer.stats.connectRequestCount + mainProxyServer.stats.httpRequestCount);
-                        if (useUpstreamProxy) expect(upstreamCount).to.be.below(upstreamProxyRequestCount);
+                        if (useMainProxy) {
+                            expect(mainCount).to.be.below(mainProxyServer.stats.connectRequestCount + mainProxyServer.stats.httpRequestCount);
+                        }
+
+                        if (useUpstreamProxy) {
+                            expect(upstreamCount).to.be.below(upstreamProxyRequestCount);
+                        }
                     });
             });
         };
+
+        if (useUpstreamProxy) {
+            _it('upstream ipv6', async () => {
+                upstreamProxyHostname = '[::1]';
+                const opts = getRequestOpts('/hello-world');
+
+                try {
+                    const response = await requestPromised(opts);
+
+                    expect(response.body).to.eql('Hello world!');
+                    expect(response.statusCode).to.eql(200);
+                } finally {
+                    upstreamProxyHostname = '127.0.0.1';
+                }
+            });
+        } else if (useMainProxy && process.versions.node.split('.')[0] >= 15) {
+            // Version check is required because HTTP/2 negotiation
+            // is not supported on Node.js < 15.
+
+            _it('direct ipv6', async () => {
+                const opts = getRequestOpts('/hello-world');
+                opts.url = opts.url.replace('127.0.0.1', '[::1]');
+
+                // `request` proxy implementation fails to normalize IPv6.
+                // `got-scraping` normalizes IPv6 properly.
+                const response = await gotScraping({
+                    url: opts.url,
+                    headers: opts.headers,
+                    timeout: {
+                        request: opts.timeout,
+                    },
+                    proxyUrl: opts.proxy,
+                    https: {
+                        key: opts.key,
+                    },
+                });
+
+                expect(response.body).to.eql('Hello world!');
+                expect(response.statusCode).to.eql(200);
+            });
+        } else if (!useSsl && process.versions.node.split('.')[0] >= 15) {
+            // Version check is required because HTTP/2 negotiation
+            // is not supported on Node.js < 15.
+
+            _it('forward ipv6', async () => {
+                const opts = getRequestOpts('/hello-world');
+                opts.url = opts.url.replace('127.0.0.1', '[::1]');
+
+                // `request` proxy implementation fails to normalize IPv6.
+                // `got-scraping` normalizes IPv6 properly.
+                const response = await gotScraping({
+                    url: opts.url,
+                    headers: opts.headers,
+                    timeout: {
+                        request: opts.timeout,
+                    },
+                    proxyUrl: opts.proxy,
+                    https: {
+                        key: opts.key,
+                    },
+                });
+
+                expect(response.body).to.eql('Hello world!');
+                expect(response.statusCode).to.eql(200);
+            });
+        }
 
         ['GET', 'POST', 'PUT', 'DELETE'].forEach((method) => {
             _it(`handles simple ${method} request`, () => {
@@ -451,7 +599,16 @@ const createTestSuite = ({
         // NOTE: upstream proxy cannot handle non-standard headers
         if (!useUpstreamProxy) {
             _it('ignores non-standard server HTTP headers', () => {
-                const opts = getRequestOpts('/get-non-standard-headers');
+                // Node 12+ uses a new HTTP parser (https://llhttp.org/),
+                // which throws error on HTTP headers values with invalid chars.
+                // So we skip this test for Node 12+.
+                // Note that after Node.js introduced a stricter HTTP parsing as a security hotfix
+                // (https://snyk.io/blog/node-js-release-fixes-a-critical-http-security-vulnerability/)
+                // this test broke down so we had to add NODE_OPTIONS=--insecure-http-parser to "npm test" command
+                const nodeMajorVersion = parseInt(process.versions.node.split('.')[0], 10);
+                const skipInvalidHeaderValue = nodeMajorVersion >= 12;
+
+                const opts = getRequestOpts(`/get-non-standard-headers?skipInvalidHeaderValue=${skipInvalidHeaderValue ? '1' : '0'}`);
                 opts.method = 'GET';
                 return requestPromised(opts)
                     .then((response) => {
@@ -470,10 +627,27 @@ const createTestSuite = ({
                             expect(response.headers['invalid-header-value']).to.eql(undefined);
                         } else {
                             expect(response.headers['invalid header with space']).to.eql('HeaderValue1');
-                            expect(response.headers['invalid-header-value']).to.eql('some\value');
+                            expect(response.headers['invalid-header-value']).to.eql(skipInvalidHeaderValue ? undefined : 'some\value');
                         }
                     });
             });
+
+            if (!useSsl) {
+                _it('gracefully fails on invalid HTTP status code', () => {
+                    const opts = getRequestOpts('/get-invalid-status-code');
+                    opts.method = 'GET';
+                    return requestPromised(opts)
+                        .then((response) => {
+                            if (useMainProxy) {
+                                expect(response.statusCode).to.eql(592);
+                                expect(response.body).to.eql('Bad status!');
+                            } else {
+                                expect(response.statusCode).to.eql(55);
+                                expect(response.body).to.eql('Bad status!');
+                            }
+                        });
+                });
+            }
         }
 
         _it('save repeating server HTTP headers', () => {
@@ -485,15 +659,56 @@ const createTestSuite = ({
                     expect(response.statusCode).to.eql(200);
                     expect(response.headers).to.be.an('object');
 
-                    // The server returns two headers with same names:
-                    //  ... 'Repeating-Header', 'HeaderValue1' ... 'Repeating-Header', 'HeaderValue2' ...
-                    // All headers should be present
-                    const firstIndex = response.rawHeaders.indexOf('Repeating-Header');
-                    expect(response.rawHeaders[firstIndex + 1]).to.eql('HeaderValue1');
-                    const secondIndex = response.rawHeaders.indexOf('Repeating-Header', firstIndex + 1);
-                    expect(response.rawHeaders[secondIndex + 1]).to.eql('HeaderValue2');
+                    expect(response.headers['repeating-header']).to.eql('HeaderValue1, HeaderValue2');
                 });
         });
+
+        if (!useSsl) {
+            _it('handles double Host header', () => {
+                // This is a regression test, duplication of Host headers caused the proxy to throw
+                // "TypeError: hostHeader.startsWith is not a function"
+                // The only way to test this is to send raw HTTP request via TCP socket.
+                return new Promise((resolve, reject) => {
+                    let port;
+                    let httpMsg;
+                    if (useMainProxy) {
+                        port = mainProxyServerPort;
+                        httpMsg = `GET http://localhost:${targetServerPort}/echo-raw-headers HTTP/1.1\r\n`
+                            + 'Host: dummy1.example.com\r\n'
+                            + 'Host: dummy2.example.com\r\n';
+                        if (mainProxyAuth) {
+                            const auth = Buffer.from(`${mainProxyAuth.username}:${mainProxyAuth.password}`).toString('base64');
+                            httpMsg += `Proxy-Authorization: Basic ${auth}\r\n`;
+                        }
+                        httpMsg += '\r\n';
+                    } else {
+                        port = targetServerPort;
+                        httpMsg = 'GET /echo-raw-headers HTTP/1.1\r\n'
+                            + 'Host: dummy1.example.com\r\n'
+                            + 'Host: dummy2.example.com\r\n\r\n';
+                    }
+
+                    const client = net.createConnection({ port }, () => {
+                        // console.log('connected to server! sending msg: ' + httpMsg);
+                        client.write(httpMsg);
+                    });
+                    client.on('data', (data) => {
+                        // console.log('received data: ' + data.toString());
+                        try {
+                            expect(data.toString()).to.match(/^HTTP\/1\.1 200 OK/);
+                            client.end();
+                        } catch (err) {
+                            reject(err);
+                        }
+                    });
+                    client.on('end', () => {
+                        // console.log('disconnected from server');
+                        resolve();
+                    });
+                    client.on('error', reject);
+                });
+            });
+        }
 
         _it('handles large streamed POST payload', () => {
             const opts = getRequestOpts('/echo-payload');
@@ -517,10 +732,14 @@ const createTestSuite = ({
                 intervalId = setInterval(() => {
                     if (chunkIndex >= DATA_CHUNKS.length) {
                         passThrough.end();
+                        clearInterval(intervalId);
                         return;
                     }
                     passThrough.write(DATA_CHUNKS[chunkIndex++], (err) => {
-                        if (err) reject(err);
+                        if (err) {
+                            clearInterval(intervalId);
+                            reject(err);
+                        }
                     });
                 }, 1);
             })
@@ -547,7 +766,7 @@ const createTestSuite = ({
                             return 0;
                         });
                         const lastConnectionId = sortedIds[sortedIds.length - 1];
-                        const stats = mainProxyServer.getConnectionStats(lastConnectionId)
+                        const stats = mainProxyServer.getConnectionStats(Number(lastConnectionId))
                             || mainProxyServerConnectionId2Stats[lastConnectionId];
 
                         // 5% range because network negotiation adds to network trafic
@@ -583,9 +802,19 @@ const createTestSuite = ({
                     expect(response.statusCode).to.eql(401);
                 })
                 .then(() => {
-                    // Then test valid ones
+                    // Then test valid ones (passed as they are)
                     const opts = getRequestOpts('/basic-auth');
-                    opts.url = opts.url.replace('://', '://john.doe:Passwd@');
+                    opts.url = opts.url.replace('://', '://john.doe$:Passwd$@');
+                    return requestPromised(opts);
+                })
+                .then((response) => {
+                    expect(response.body).to.eql('OK');
+                    expect(response.statusCode).to.eql(200);
+                })
+                .then(() => {
+                    // Then test URI encoded characters (must also work)
+                    const opts = getRequestOpts('/basic-auth');
+                    opts.url = opts.url.replace('://', '://john.doe%24:Passwd%24@');
                     return requestPromised(opts);
                 })
                 .then((response) => {
@@ -594,34 +823,54 @@ const createTestSuite = ({
                 });
         });
 
-        // NOTE: PhantomJS cannot handle proxy auth with empty user or password, both need to be present!
         if (!mainProxyAuth || (mainProxyAuth.username && mainProxyAuth.password)) {
-            _it('handles GET request from PhantomJS', () => {
-                return Promise.resolve()
-                    .then(() => {
-                        // NOTE: use other hostname than 'localhost' or '127.0.0.1' otherwise PhantomJS would skip the proxy!
-                        const phantomUrl = `${useSsl ? 'https' : 'http'}://${LOCALHOST_TEST}:${targetServerPort}/hello-world`;
-                        return phantomGet(phantomUrl, mainProxyUrl);
-                    })
-                    .then((response) => {
-                        expect(response).to.contain('Hello world!');
-                    });
+            it('handles GET request using puppeteer', async () => {
+                const phantomUrl = `${useSsl ? 'https' : 'http'}://${LOCALHOST_TEST}:${targetServerPort}/hello-world`;
+                const response = await puppeteerGet(phantomUrl, mainProxyUrl);
+                expect(response).to.contain('Hello world!');
             });
         }
 
-        const testWsCall = (useHttpUpgrade) => {
-            return new Promise((resolve, reject) => {
-                // Create an instance of the `HttpsProxyAgent` class with the proxy server information
-                let agent = null;
-                if (useMainProxy) {
-                    const options = url.parse(mainProxyUrl);
-                    agent = new HttpsProxyAgent(options);
-                }
+        if (!useSsl && mainProxyAuth && mainProxyAuth.username && mainProxyAuth.password) {
+            it('handles GET request using puppeteer with invalid credentials', async () => {
+                const phantomUrl = `${useSsl ? 'https' : 'http'}://${LOCALHOST_TEST}:${targetServerPort}/hello-world`;
+                const response = await puppeteerGet(phantomUrl, `http://bad:password@127.0.0.1:${mainProxyServerPort}`);
+                expect(response).to.contain('Proxy credentials required');
+            });
+        }
 
-                const wsUrl = useHttpUpgrade
-                    ? `${useSsl ? 'https' : 'http'}://127.0.0.1:${targetServerPort}`
-                    : `${useSsl ? 'wss' : 'ws'}://127.0.0.1:${targetServerWsPort}`;
-                const ws = new WebSocket(wsUrl, { agent });
+        // Test also curl, to see how other HTTP clients do
+        // NOTE: curl doesn't support auth without username with only password
+        if (!mainProxyAuth || mainProxyAuth.username) {
+            _it('handles GET request from curl', async () => {
+                const curlUrl = `${useSsl ? 'https' : 'http'}://${LOCALHOST_TEST}:${targetServerPort}/hello-world`;
+                const output = await curlGet(curlUrl, mainProxyUrl, true);
+                expect(output).to.contain('Hello world!');
+            });
+        }
+
+        if (mainProxyAuth && mainProxyAuth.username) {
+            it('handles GET request from curl with invalid credentials', async () => {
+                const curlUrl = `${useSsl ? 'https' : 'http'}://${LOCALHOST_TEST}:${targetServerPort}/hello-world`;
+                // For SSL, we need to return curl's stderr to check what kind of error was there
+                const output = await curlGet(curlUrl, `http://bad:password@127.0.0.1:${mainProxyServerPort}`, !useSsl);
+                if (useSsl) {
+                    expect(output).to.contain('Received HTTP code 407 from proxy after CONNECT');
+                } else {
+                    expect(output).to.contain('Proxy credentials required');
+                }
+            });
+        }
+
+        const testWsCall = () => {
+            return new Promise((resolve, reject) => {
+                const wsUrl = `${useSsl ? 'wss' : 'ws'}://127.0.0.1:${targetServerPort}`;
+                const ws = new WebSocket.Client(wsUrl, [], {
+                    proxy: {
+                        origin: mainProxyUrl,
+                        tls: useSsl ? { cert: sslCrt } : null,
+                    },
+                });
 
                 ws.on('error', (err) => {
                     ws.close();
@@ -630,9 +879,9 @@ const createTestSuite = ({
                 ws.on('open', () => {
                     ws.send('hello world');
                 });
-                ws.on('message', (data) => {
+                ws.on('message', (event) => {
                     ws.close();
-                    resolve(data);
+                    resolve(event.data);
                 });
             })
                 .then((data) => {
@@ -640,18 +889,53 @@ const createTestSuite = ({
                 });
         };
 
-        _it('handles web socket connection (upgrade from HTTP)', () => {
-            return testWsCall(true);
+        _it('handles web socket connection', () => {
+            return testWsCall(false);
         });
 
-        if (!useSsl) {
-            // TODO: make this work also for SSL connection
-            _it('handles web socket connection (direct)', () => {
-                return testWsCall(false);
-            });
-        }
-
         if (useMainProxy) {
+            if (!useUpstreamProxy) {
+                _it(`handles malformed response`, async () => {
+                    const server = net.createServer((socket) => {
+                        socket.end(`HTTP/1.1 x \r\n\r\n`);
+                    });
+
+                    await new Promise((resolve, reject) => {
+                        server.once('error', reject);
+
+                        server.listen(0, () => {
+                            server.off('error', reject);
+                            resolve();
+                        });
+                    });
+
+                    const opts = getRequestOpts(`http://127.0.0.1:${server.address().port}`);
+                    return requestPromised(opts)
+                        .then((response) => {
+                            expect(response.statusCode).to.eql(599);
+                            server.close();
+                        });
+                });
+            }
+
+            it('handles invalid CONNECT path', (done) => {
+                const req = http.request(mainProxyUrl, {
+                    method: 'CONNECT',
+                    path: ':443',
+                    headers: {
+                        host: ':443',
+                    },
+                });
+                req.once('connect', (response, socket, head) => {
+                    expect(response.statusCode).to.equal(400);
+
+                    socket.destroy();
+                    done();
+                });
+
+                req.end();
+            });
+
             _it('returns 404 for non-existent hostname', () => {
                 const opts = getRequestOpts(`http://${NON_EXISTENT_HOSTNAME}`);
                 return requestPromised(opts)
@@ -671,18 +955,50 @@ const createTestSuite = ({
             _it('removes hop-by-hop headers (HTTP-only) and leaves other ones', () => {
                 const opts = getRequestOpts('/echo-request-info');
                 opts.headers['X-Test-Header'] = 'my-test-value';
-                opts.headers['Transfer-Encoding'] = 'identity';
+                opts.headers.TE = 'MyTest';
                 return requestPromised(opts)
                     .then((response) => {
                         expect(response.statusCode).to.eql(200);
                         expect(response.headers['content-type']).to.eql('application/json');
                         const req = JSON.parse(response.body);
                         expect(req.headers['x-test-header']).to.eql('my-test-value');
-                        expect(req.headers['transfer-encoding']).to.eql(useSsl ? 'identity' : undefined);
+                        expect(req.headers.te).to.eql(useSsl ? 'MyTest' : undefined);
                     });
             });
 
             if (mainProxyAuth) {
+                it('implies username if colon missing', (done) => {
+                    const server = net.createServer((socket) => {
+                        socket.end();
+                    });
+
+                    server.once('error', (error) => {
+                        done(error);
+                    });
+
+                    server.listen(0, () => {
+                        const req = http.request(mainProxyUrl, {
+                            method: 'CONNECT',
+                            path: `127.0.0.1:${server.address().port}`,
+                            headers: {
+                                host: `127.0.0.1:${server.address().port}`,
+                                'proxy-authorization': `Basic ${Buffer.from('nopassword').toString('base64')}`,
+                            },
+                        });
+                        req.once('connect', (response, socket, head) => {
+                            expect(response.statusCode).to.equal(200);
+                            expect(head.length).to.equal(0);
+
+                            socket.destroy();
+                            server.close(() => {
+                                done();
+                            });
+                        });
+
+                        req.end();
+                    });
+                });
+
                 it('returns 407 for invalid credentials', () => {
                     return Promise.resolve()
                         .then(() => {
@@ -719,43 +1035,81 @@ const createTestSuite = ({
 
                 it('returns 500 on error in prepareRequestFunction', () => {
                     return Promise.resolve()
-                    .then(() => {
-                        const opts = getRequestOpts(`${useSsl ? 'https' : 'http'}://activate-error-in-prep-req-func-throw`);
-                        return testForErrorResponse(opts, 500);
-                    })
-                    .then(() => {
-                        const opts = getRequestOpts(`${useSsl ? 'https' : 'http'}://activate-error-in-prep-req-func-promise`);
-                        return testForErrorResponse(opts, 500);
-                    })
-                    .then(() => {
-                        const opts = getRequestOpts(`${useSsl ? 'https' : 'http'}://activate-error-in-prep-req-func-throw-known`);
-                        return testForErrorResponse(opts, 501);
-                    })
-                    .then(() => {
-                        const opts = getRequestOpts(`${useSsl ? 'https' : 'http'}://activate-error-in-prep-req-func-promise-known`);
-                        return testForErrorResponse(opts, 501);
-                    });
+                        .then(() => {
+                            const opts = getRequestOpts(`${useSsl ? 'https' : 'http'}://activate-error-in-prep-req-func-throw.gov`);
+                            return testForErrorResponse(opts, 500);
+                        })
+                        .then(() => {
+                            const opts = getRequestOpts(`${useSsl ? 'https' : 'http'}://activate-error-in-prep-req-func-promise.gov`);
+                            return testForErrorResponse(opts, 500);
+                        })
+                        .then(() => {
+                            const opts = getRequestOpts(`${useSsl ? 'https' : 'http'}://activate-error-in-prep-req-func-throw-known.gov`);
+                            return testForErrorResponse(opts, 501);
+                        })
+                        .then(() => {
+                            const opts = getRequestOpts(`${useSsl ? 'https' : 'http'}://activate-error-in-prep-req-func-promise-known.gov`);
+                            return testForErrorResponse(opts, 501);
+                        });
                 });
             }
 
             if (useUpstreamProxy) {
+                it('fails gracefully on invalid upstream proxy scheme', () => {
+                    const opts = getRequestOpts(`${useSsl ? 'https' : 'http'}://activate-invalid-upstream-proxy-scheme.gov`);
+                    return testForErrorResponse(opts, 500);
+                });
+
                 it('fails gracefully on invalid upstream proxy URL', () => {
-                    const opts = getRequestOpts(`${useSsl ? 'https' : 'http'}://activate-invalid-upstream-proxy-host`);
-                    return testForErrorResponse(opts, 502);
+                    const opts = getRequestOpts(`${useSsl ? 'https' : 'http'}://activate-invalid-upstream-proxy-url.gov`);
+                    return testForErrorResponse(opts, 500);
+                });
+
+                it('fails gracefully on invalid upstream proxy username', async () => {
+                    const opts = getRequestOpts(`${useSsl ? 'https' : 'http'}://activate-invalid-upstream-proxy-username`);
+
+                    if (useSsl) {
+                        try {
+                            await requestPromised(opts);
+                            expect(false).to.be.eql(true);
+                        } catch (error) {
+                            expect(error.message).to.be.eql('tunneling socket could not be established, statusCode=597');
+                        }
+                    } else {
+                        const response = await requestPromised(opts);
+
+                        expect(response.statusCode).to.be.eql(597);
+                        expect(response.body).to.be.eql('Invalid colon in username in upstream proxy credentials');
+                    }
+                });
+
+                it('fails gracefully on non-existent upstream proxy host', () => {
+                    const opts = getRequestOpts(`${useSsl ? 'https' : 'http'}://activate-unknown-upstream-proxy-host.gov`);
+                    return testForErrorResponse(opts, 593);
                 });
 
                 if (upstreamProxyAuth) {
-                    _it('fails gracefully on invalid upstream proxy credentials', () => {
-                        const opts = getRequestOpts(`${useSsl ? 'https' : 'http'}://activate-invalid-upstream-proxy-credentials`);
-                        return testForErrorResponse(opts, 502);
+                    _it('fails gracefully on bad upstream proxy credentials', () => {
+                        const opts = getRequestOpts(`${useSsl ? 'https' : 'http'}://activate-bad-upstream-proxy-credentials.gov`);
+                        return testForErrorResponse(opts, 597);
                     });
                 }
             }
 
             if (testCustomResponse) {
                 if (!useSsl) {
+                    it('supports custom response - buffer', () => {
+                        const opts = getRequestOpts('http://test-custom-response-buffer.gov');
+                        opts.gzip = true;
+                        return requestPromised(opts)
+                            .then((response) => {
+                                expect(response.statusCode).to.eql(200);
+                                expect(response.body).to.eql('Hello, world!');
+                            });
+                    });
+
                     it('supports custom response - simple', () => {
-                        const opts = getRequestOpts('http://test-custom-response-simple/some/path');
+                        const opts = getRequestOpts('http://test-custom-response-simple.gov/some/path');
                         return requestPromised(opts)
                             .then((response) => {
                                 expect(response.statusCode).to.eql(200);
@@ -764,7 +1118,7 @@ const createTestSuite = ({
                     });
 
                     it('supports custom response - complex', () => {
-                        const opts = getRequestOpts('http://test-custom-response-complex:1234/some/path?query=456');
+                        const opts = getRequestOpts('http://test-custom-response-complex.gov:1234/some/path?query=456');
                         return requestPromised(opts)
                             .then((response) => {
                                 expect(response.statusCode).to.eql(201);
@@ -777,7 +1131,7 @@ const createTestSuite = ({
                     });
 
                     it('supports custom response - long', () => {
-                        const opts = getRequestOpts('http://test-custom-response-long');
+                        const opts = getRequestOpts('http://test-custom-response-long.gov');
                         return requestPromised(opts)
                             .then((response) => {
                                 expect(response.statusCode).to.eql(200);
@@ -788,7 +1142,7 @@ const createTestSuite = ({
                     });
 
                     it('supports custom response - promised', () => {
-                        const opts = getRequestOpts('http://test-custom-response-promised/some/path');
+                        const opts = getRequestOpts('http://test-custom-response-promised.gov/some/path');
                         return requestPromised(opts)
                             .then((response) => {
                                 expect(response.statusCode).to.eql(200);
@@ -797,12 +1151,12 @@ const createTestSuite = ({
                     });
 
                     it('fails on invalid custom response function', () => {
-                        const opts = getRequestOpts('http://test-custom-response-invalid');
+                        const opts = getRequestOpts('http://test-custom-response-invalid.gov');
                         return testForErrorResponse(opts, 500);
                     });
                 } else {
                     it('does not support custom response in SSL mode', () => {
-                        const opts = getRequestOpts('https://test-custom-response-simple/some/path');
+                        const opts = getRequestOpts('https://test-custom-response-simple.gov/some/path');
                         return testForErrorResponse(opts, 500);
                     });
                 }
@@ -838,7 +1192,10 @@ const createTestSuite = ({
                 })
                 .then(() => {
                     if (upstreamProxyServer) {
-                        return Promise.promisify(upstreamProxyServer.close).bind(upstreamProxyServer)();
+                        // NOTE: We used to wait for upstream proxy connections to close,
+                        // but for HTTPS, in Node 10+, they linger for some reason...
+                        // return util.promisify(upstreamProxyServer.close).bind(upstreamProxyServer)();
+                        upstreamProxyServer.close();
                     }
                 })
                 .then(() => {
@@ -850,12 +1207,27 @@ const createTestSuite = ({
     };
 };
 
+describe('Test 0 port option', async () => {
+    it('Port inherits net port', async () => {
+        for (let i = 0; i < 10; i++) {
+            const server = new Server({
+                port: 0,
+            });
+            // eslint-disable-next-line no-await-in-loop
+            await server.listen();
+            expect(server.port).to.be.eql(server.server.address().port);
+            server.close(true);
+        }
+    });
+});
+
 describe(`Test ${LOCALHOST_TEST} setup`, () => {
     it('works', () => {
-        return Promise.promisify(dns.lookup).bind(dns)(LOCALHOST_TEST, { family: 4 })
-            .then((address) => {
+        return util.promisify(dns.lookup).bind(dns)(LOCALHOST_TEST, { family: 4 })
+            .then(({ address, family }) => {
                 // If this fails, see README.md !!!
                 expect(address).to.eql('127.0.0.1');
+                expect(family).to.eql(4);
             });
     });
 });
@@ -869,6 +1241,200 @@ describe('Server (HTTPS -> Target)', createTestSuite({
     useSsl: true,
     useMainProxy: false,
 }));
+
+describe('non-200 upstream connect response', () => {
+    // No assertion planning :(
+    // https://github.com/chaijs/chai/issues/670
+    let success = false;
+
+    after(() => {
+        if (!success) {
+            throw new Error('Failed');
+        }
+    });
+
+    it('fails downstream with 590', (done) => {
+        const server = http.createServer();
+        server.on('connect', (_request, socket) => {
+            socket.once('error', () => {});
+            socket.end('HTTP/1.1 403 Forbidden\r\ncontent-length: 1\r\n\r\na');
+        });
+        server.listen(() => {
+            const serverPort = server.address().port;
+            const proxyServer = new ProxyChain.Server({
+                port: 0,
+                prepareRequestFunction: () => {
+                    return {
+                        upstreamProxyUrl: `http://localhost:${serverPort}`,
+                    };
+                },
+            });
+            proxyServer.listen(() => {
+                const proxyServerPort = proxyServer.port;
+
+                const req = http.request({
+                    method: 'CONNECT',
+                    host: 'localhost',
+                    port: proxyServerPort,
+                    path: 'example.com:443',
+                    headers: {
+                        host: 'example.com:443',
+                    },
+                });
+                req.once('connect', (response, socket, head) => {
+                    expect(response.statusCode).to.equal(590);
+                    expect(response.statusMessage).to.equal('UPSTREAM403');
+                    expect(head.length).to.equal(0);
+                    success = true;
+
+                    socket.once('close', () => {
+                        proxyServer.close();
+                        server.close();
+
+                        done();
+                    });
+                });
+
+                req.end();
+            });
+        });
+    });
+});
+
+it('supports localAddress', async () => {
+    const target = http.createServer((serverRequest, serverResponse) => {
+        serverResponse.end(serverRequest.socket.remoteAddress);
+    });
+
+    await util.promisify(target.listen.bind(target))(0);
+
+    const server = new Server({
+        port: 0,
+        prepareRequestFunction: () => {
+            return {
+                localAddress: '127.0.0.2',
+            };
+        },
+    });
+
+    await server.listen();
+
+    const response = await requestPromised({
+        url: `http://127.0.0.1:${target.address().port}`,
+        proxy: `http://127.0.0.2:${server.port}`,
+    });
+
+    try {
+        expect(response.body).to.be.equal('::ffff:127.0.0.2');
+    } finally {
+        await server.close();
+        await util.promisify(target.close.bind(target))();
+    }
+});
+
+it('supports custom CONNECT server handler', async () => {
+    const server = new Server({
+        port: 0,
+        prepareRequestFunction: () => {
+            const customConnectServer = http.createServer((_request, response) => {
+                response.end('Hello, world!');
+            });
+
+            return {
+                customConnectServer,
+            };
+        },
+    });
+
+    await server.listen();
+
+    try {
+        const response = await new Promise((resolve, reject) => {
+            http.request(`http://127.0.0.1:${server.port}`, {
+                method: 'CONNECT',
+                path: 'example.com:80',
+                headers: {
+                    host: 'example.com:80',
+                },
+            }).on('connect', (connectResponse, socket, head) => {
+                http.request('http://example.com', {
+                    createConnection: () => socket,
+                }, (res) => {
+                    const buffer = [];
+
+                    res.on('data', (chunk) => {
+                        buffer.push(chunk);
+                    });
+
+                    res.on('end', () => {
+                        resolve(Buffer.concat(buffer).toString());
+                    });
+                }).on('error', reject).end();
+            }).on('error', reject).end();
+        });
+
+        expect(response).to.be.equal('Hello, world!');
+    } finally {
+        await server.close();
+    }
+});
+
+it('supports pre-response CONNECT payload', (done) => {
+    const plain = net.createServer((socket) => {
+        socket.pipe(socket);
+    });
+
+    plain.once('error', done);
+
+    plain.listen(0, async () => {
+        const server = new Server({
+            port: 0,
+        });
+
+        try {
+            await server.listen();
+        } catch (error) {
+            done(error);
+            return;
+        }
+
+        const socket = net.connect({
+            host: '127.0.0.1',
+            port: server.port,
+        });
+
+        socket.write([
+            `CONNECT 127.0.0.1:${plain.address().port} HTTP/1.1`,
+            `Host: 127.0.0.1:${plain.address().port}`,
+            ``,
+            `foobar`,
+        ].join('\r\n'));
+
+        let success = false;
+
+        socket.once('error', done);
+        socket.on('data', (data) => {
+            success = data.includes('foobar');
+            socket.end();
+        });
+
+        socket.setTimeout(1000, () => {
+            socket.destroy(new Error('Socket timed out'));
+        });
+
+        socket.once('close', () => {
+            plain.close(async () => {
+                await server.close();
+
+                if (success) {
+                    done();
+                } else {
+                    done(new Error('failure'));
+                }
+            });
+        });
+    });
+});
 
 // Run all combinations of test parameters
 const useSslVariants = [
@@ -888,16 +1454,17 @@ const useUpstreamProxyVariants = [
 const upstreamProxyAuthVariants = [
     null,
     { type: 'Basic', username: 'userA', password: '' },
-    { type: 'Basic', username: 'userB', password: 'passA' },
+    // Test special chars, note that we URI-encode just username when constructing the proxyUrl,
+    // to test both correctly and incorrectly encoded auth
+    { type: 'Basic', username: 'us%erB', password: 'p$as%sA' },
 ];
 
 useSslVariants.forEach((useSsl) => {
     mainProxyAuthVariants.forEach((mainProxyAuth) => {
-
         const baseDesc = `Server (${useSsl ? 'HTTPS' : 'HTTP'} -> Main proxy`;
 
         // Test custom response separately (it doesn't use upstream proxies)
-        describe(`${baseDesc} - custom response)`, createTestSuite({
+        describe(`${baseDesc} -> Target + custom responses)`, createTestSuite({
             useMainProxy: true,
             useSsl,
             mainProxyAuth,
@@ -913,17 +1480,17 @@ useSslVariants.forEach((useSsl) => {
                 let desc = `${baseDesc} `;
 
                 if (mainProxyAuth) {
-                    if (!mainProxyAuth) {
-                        desc += 'public ';
-                    } else if (mainProxyAuth.username && mainProxyAuth.password) desc += 'with username:password ';
-                    else desc += 'with username only ';
+                    if (!mainProxyAuth) desc += 'public ';
+                    else if (mainProxyAuth.username && mainProxyAuth.password) desc += 'with username:password ';
+                    else if (mainProxyAuth.username) desc += 'with username only ';
+                    else desc += 'with password only ';
                 }
                 if (useUpstreamProxy) {
                     desc += '-> Upstream proxy ';
-                    if (!upstreamProxyAuth) {
-                        desc += 'public ';
-                    } else if (upstreamProxyAuth.username && upstreamProxyAuth.password) desc += 'with username:password ';
-                    else desc += 'with username only ';
+                    if (!upstreamProxyAuth) desc += 'public ';
+                    else if (upstreamProxyAuth.username && upstreamProxyAuth.password) desc += 'with username:password ';
+                    else if (upstreamProxyAuth.username) desc += 'with username only ';
+                    else desc += 'with password only ';
                 }
                 desc += '-> Target)';
 

@@ -1,25 +1,21 @@
-import _ from 'underscore';
-import { expect, assert } from 'chai';
-import proxy from 'proxy';
-import http from 'http';
-import portastic from 'portastic';
-import basicAuthParser from 'basic-auth-parser';
-import Promise from 'bluebird';
-import request from 'request';
-import express from 'express';
+const _ = require('underscore');
+const { expect, assert } = require('chai');
+const proxy = require('proxy');
+const http = require('http');
+const util = require('util');
+const portastic = require('portastic');
+const basicAuthParser = require('basic-auth-parser');
+const request = require('request');
+const express = require('express');
 
-import { anonymizeProxy, closeAnonymizedProxy } from '../build/anonymize_proxy';
-import { PORT_SELECTION_CONFIG } from '../build/tools';
+const { anonymizeProxy, closeAnonymizedProxy } = require('../src/index');
 
-/* globals process */
-
-const ORIG_PORT_SELECTION_CONFIG = { ...PORT_SELECTION_CONFIG };
-
+let expressServer;
 let proxyServer;
-let proxyPort; // eslint-disable-line no-unused-vars
+let proxyPort;
 let testServerPort;
 const proxyAuth = { scheme: 'Basic', username: 'username', password: '' };
-let wasProxyCalled = false; // eslint-disable-line no-unused-vars
+let wasProxyCalled = false;
 
 // Setup local proxy server and web server for the tests
 before(() => {
@@ -64,8 +60,7 @@ before(() => {
 
             testServerPort = freePorts[1];
             return new Promise((resolve, reject) => {
-                app.listen(testServerPort, (err) => {
-                    if (err) reject(err);
+                expressServer = app.listen(testServerPort, () => {
                     resolve();
                 });
             });
@@ -74,9 +69,10 @@ before(() => {
 
 after(function () {
     this.timeout(5 * 1000);
-    if (proxyServer) return Promise.promisify(proxyServer.close).bind(proxyServer)();
-});
+    expressServer.close();
 
+    if (proxyServer) return util.promisify(proxyServer.close).bind(proxyServer)();
+});
 
 const requestPromised = (opts) => {
     // console.log('requestPromised');
@@ -201,9 +197,5 @@ describe('utils.anonymizeProxyNoPassword', function () {
             .then((closed) => {
                 expect(closed).to.eql(false);
             });
-    });
-
-    after(() => {
-        Object.assign(PORT_SELECTION_CONFIG, PORT_SELECTION_CONFIG);
     });
 });
