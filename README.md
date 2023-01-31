@@ -1,7 +1,7 @@
 # Programmable HTTP proxy server for Node.js
 
 [![npm version](https://badge.fury.io/js/proxy-chain.svg)](http://badge.fury.io/js/proxy-chain)
-[![Build Status](https://travis-ci.org/apifytech/proxy-chain.svg)](https://travis-ci.org/apifytech/proxy-chain)
+[![Build Status](https://travis-ci.com/apify/proxy-chain.svg?branch=master)](https://travis-ci.com/apify/proxy-chain)
 
 Node.js implementation of a proxy server (think Squid) with support for SSL, authentication, upstream proxy chaining,
 custom HTTP responses and measuring traffic statistics.
@@ -17,7 +17,6 @@ The package is used for this exact purpose by the [Apify web scraping platform](
 
 To learn more about the rationale behind this package,
 read [How to make headless Chrome and Puppeteer use a proxy server with authentication](https://medium.com/@jancurn/how-to-make-headless-chrome-and-puppeteer-use-a-proxy-server-with-authentication-249a21a79212).
-
 
 ## Run a simple HTTP/HTTPS proxy server
 
@@ -43,8 +42,9 @@ const server = new ProxyChain.Server({
     // Enables verbose logging
     verbose: true,
 
-    // Custom function to authenticate proxy requests and provide the URL to chained upstream proxy.
-    // It must return an object (or promise resolving to the object) with the following form:
+    // Custom user-defined function to authenticate incoming proxy requests,
+    // and optionally provide the URL to chained upstream proxy.
+    // The function must return an object (or promise resolving to the object) with the following signature:
     // { requestAuthentication: Boolean, upstreamProxyUrl: String }
     // If the function is not defined or is null, the server runs in simple mode.
     // Note that the function takes a single argument with the following properties:
@@ -59,13 +59,19 @@ const server = new ProxyChain.Server({
     // * connectionId - Unique ID of the HTTP connection. It can be used to obtain traffic statistics.
     prepareRequestFunction: ({ request, username, password, hostname, port, isHttp, connectionId }) => {
         return {
-            // Require clients to authenticate with username 'bob' and password 'TopSecret'
+            // If set to true, the client is sent HTTP 407 resposne with the Proxy-Authenticate header set,
+            // requiring Basic authentication. Here you can verify user credentials.
             requestAuthentication: username !== 'bob' || password !== 'TopSecret',
 
             // Sets up an upstream HTTP proxy to which all the requests are forwarded.
             // If null, the proxy works in direct mode, i.e. the connection is forwarded directly
-            // to the target server.
+            // to the target server. This field is ignored if "requestAuthentication" is true.
+            // The username and password must be URI-encoded.
             upstreamProxyUrl: `http://username:password@proxy.example.com:3128`,
+
+            // If "requestAuthentication" is true, you can use the following property
+            // to define a custom error message to return to the client instead of the default "Proxy credentials required"
+            failMsg: 'Bad username or password, please try again.',
         };
     },
 });
@@ -87,6 +93,77 @@ server.on('requestFailed', ({ request, error }) => {
 });
 ```
 
+## A different approach to `502 Bad Gateway`
+
+`502` status code is not comprehensive enough. Therefore, the server may respond with `590-599` instead:
+
+### `590 Non Successful`
+
+Upstream responded with non-200 status code.
+
+### `591 RESERVED`
+
+*This status code is reserved for further use.*
+
+### `592 Status Code Out Of Range`
+
+Upstream respondend with status code different than 100-999.
+
+### `593 Not Found`
+
+DNS lookup failed - [`EAI_NODATA`](https://github.com/libuv/libuv/blob/cdbba74d7a756587a696fb3545051f9a525b85ac/include/uv.h#L82) or [`EAI_NONAME`](https://github.com/libuv/libuv/blob/cdbba74d7a756587a696fb3545051f9a525b85ac/include/uv.h#L83).
+
+### `594 Connection Refused`
+
+Upstream refused connection.
+
+### `595 Connection Reset`
+
+Connection reset due to loss of connection or timeout.
+
+### `596 Broken Pipe`
+
+Trying to write on a closed socket.
+
+### `597 Auth Failed`
+
+Incorrect upstream credentials.
+
+### `598 RESERVED`
+
+*This status code is reserved for further use.*
+
+### `599 Upstream Error`
+
+Generic upstream error.
+
+---
+
+`590` and `592` indicate an issue on the upstream side. \
+`593` indicates an incorrect `proxy-chain` configuration.\
+`594`, `595` and `596` may occur due to connection loss.\
+`597` indicates incorrect upstream credentials.\
+`599` is a generic error, where the above is not applicable.
+
+## Custom error responses
+
+To return a custom HTTP response to indicate an error to the client,
+you can throw the `RequestError` from inside of the `prepareRequestFunction` function.
+The class constructor has the following parameters: `RequestError(body, statusCode, headers)`.
+By default, the response will have `Content-Type: text/plain; charset=utf-8`.
+
+```javascript
+const ProxyChain = require('proxy-chain');
+
+const server = new ProxyChain.Server({
+    prepareRequestFunction: ({ request, username, password, hostname, port, isHttp, connectionId }) => {
+        if (username !== 'bob') {
+           throw new ProxyChain.RequestError('Only Bob can use this proxy!', 400);
+        }
+    },
+});
+```
+
 ## Measuring traffic statistics
 
 To get traffic statistics for a certain HTTP connection, you can use:
@@ -98,12 +175,19 @@ console.dir(stats);
 The resulting object looks like:
 ```javascript
 {
+    // Number of bytes sent to client
     srcTxBytes: Number,
+    // Number of bytes received from client
     srcRxBytes: Number,
+    // Number of bytes sent to target server (proxy or website)
     trgTxBytes: Number,
+    // Number of bytes received from target server (proxy or website)
     trgRxBytes: Number,
 }
 ```
+
+If the underlying sockets were closed, the corresponding values will be `null`,
+rather than `0`.
 
 ## Custom responses
 
@@ -160,6 +244,61 @@ server.listen(() => {
 });
 ```
 
+## Routing CONNECT to another HTTP server
+
+While `customResponseFunction` enables custom handling methods such as `GET` and `POST`, many HTTP clients rely on `CONNECT` tunnels.
+It's possible to route those requests differently using the `customConnectServer` option. It accepts an instance of Node.js HTTP server.
+
+```javascript
+const http = require('http');
+const ProxyChain = require('proxy-chain');
+
+const exampleServer = http.createServer((request, response) => {
+    response.end('Hello from a custom server!');
+});
+
+const server = new ProxyChain.Server({
+    port: 8000,
+    prepareRequestFunction: ({ request, username, password, hostname, port, isHttp }) => {
+        if (request.url.toLowerCase() === 'example.com:80') {
+            return {
+                customConnectServer: exampleServer,
+            };
+        }
+
+        return {};
+    },
+});
+
+server.listen(() => {
+  console.log(`Proxy server is listening on port ${server.port}`);
+});
+```
+
+In the example above, all CONNECT tunnels to `example.com` are overridden.
+This is an unsecure server, so it accepts only `http:` requests.
+
+In order to intercept `https:` requests, `https.createServer` should be used instead, along with a self signed certificate.
+
+```javascript
+const https = require('https');
+const fs = require('fs');
+const key = fs.readFileSync('./test/ssl.key');
+const cert = fs.readFileSync('./test/ssl.crt');
+
+const exampleServer = https.createServer({
+    key,
+    cert,
+}, (request, response) => {
+    response.end('Hello from a custom server!');
+});
+```
+
+```diff
+-if (request.url.toLowerCase() === 'example.com:80') {
++if (request.url.toLowerCase() === 'example.com:443') {
+```
+
 ## Closing the server
 
 To shut down the proxy server, call the `close([destroyConnections], [callback])` function. For example:
@@ -171,7 +310,34 @@ server.close(true, () => {
 ```
 
 The `closeConnections` parameter indicates whether pending proxy connections should be forcibly closed.
+If it's `false`, the function will wait until all connections are closed, which can take a long time.
 If the `callback` parameter is omitted, the function returns a promise.
+
+
+## Accessing the CONNECT response headers for proxy tunneling
+
+Some upstream proxy providers might include valuable debugging information in the CONNECT response
+headers when establishing the proxy tunnel, for they may not modify future data in the tunneled
+connection.
+
+The proxy server would emit a `tunnelConnectResponded` event for exposing such information, where
+the parameter types of the event callback are described in [Node.js's documentation][1]. Example:
+
+[1]: https://nodejs.org/api/http.html#http_event_connect
+
+```javascript
+server.on('tunnelConnectResponded', ({ proxyChainId, response, socket, head }) => {
+    console.log(`CONNECT response headers received: ${response.headers}`);
+});
+```
+
+Alternatively a [helper function](##helper-functions) may be used:
+
+```javascript
+listenConnectAnonymizedProxy(anonymizedProxyUrl, ({ response, socket, head }) => {
+    console.log(`CONNECT response headers received: ${response.headers}`);
+});
+```
 
 
 ## Helper functions
@@ -179,7 +345,7 @@ If the `callback` parameter is omitted, the function returns a promise.
 The package also provides several utility functions.
 
 
-### `anonymizeProxy(proxyUrl, callback)`
+### `anonymizeProxy({ url, port }, callback)`
 
 Parses and validates a HTTP proxy URL. If the proxy requires authentication,
 then the function starts an open local proxy server that forwards to the proxy.
@@ -199,7 +365,7 @@ const proxyChain = require('proxy-chain');
 
 (async() => {
     const oldProxyUrl = 'http://bob:password123@proxy.example.com:8000';
-    const newProxyUrl = await proxyChain.anonymizeProxy(oldProxyUrl);
+    const newProxyUrl = await proxyChain.anonymizeProxy({ url: oldProxyUrl });
 
     // Prints something like "http://127.0.0.1:45678"
     console.log(newProxyUrl);
@@ -213,6 +379,9 @@ const proxyChain = require('proxy-chain');
     await page.goto('https://www.example.com');
     await page.screenshot({ path: 'example.png' });
     await browser.close();
+
+    // Clean up
+    await proxyChain.closeAnonymizedProxy(newProxyUrl, true);
 })();
 ```
 
@@ -223,6 +392,7 @@ If proxy was not found or was already closed, the function has no effect
 and its result is `false`. Otherwise the result is `true`.
 
 The `closeConnections` parameter indicates whether pending proxy connections are forcibly closed.
+If it's `false`, the function will wait until all connections are closed, which can take a long time.
 
 The function takes an optional callback that receives the result Boolean from the function.
 If callback is not provided, the function returns a promise instead.
@@ -231,6 +401,12 @@ If callback is not provided, the function returns a promise instead.
 
 Creates a TCP tunnel to `targetHost` that goes through a HTTP proxy server
 specified by the `proxyUrl` parameter.
+
+The optional `options` parameter is an object with the following properties:
+- `port: Number` - Enables specifying the local port to listen at. By default `0`,
+   which means a random port will be selected.
+- `hostname: String` - Local hostname to listen at. By default `localhost`.
+- `verbose: Boolean` - If `true`, the functions logs a lot. By default `false`.
 
 The result of the function is a local endpoint in a form of `hostname:port`.
 All TCP connections made to the local endpoint will be tunneled through the proxy to the target host and port.
@@ -241,6 +417,8 @@ The tunnel should be eventually closed by calling the `closeTunnel()` function.
 The `createTunnel()` function accepts an optional Node.js-style callback that receives the path to the local endpoint.
 If no callback is supplied, the function returns a promise that resolves to a String with
 the path to the local endpoint.
+
+For more information, read this [blog post](https://blog.apify.com/tunneling-arbitrary-protocols-over-http-proxy-with-static-ip-address-b3a2222191ff).
 
 Example:
 
@@ -256,17 +434,16 @@ Closes tunnel previously started by `createTunnel()`.
 The result value is `false` if the tunnel was not found or was already closed, otherwise it is `true`.
 
 The `closeConnections` parameter indicates whether pending connections are forcibly closed.
+If it's `false`, the function will wait until all connections are closed, which can take a long time.
 
 The function takes an optional callback that receives the result of the function.
 If the callback is not provided, the function returns a promise instead.
 
-### `parseUrl(url)`
+### `listenConnectAnonymizedProxy(anonymizedProxyUrl, tunnelConnectRespondedCallback)`
 
-Calls Node.js's [url.parse](https://nodejs.org/docs/latest/api/url.html#url_url_parse_urlstring_parsequerystring_slashesdenotehost)
-function and extends the resulting object with the following fields: `scheme`, `username` and `password`.
-For example, for `HTTP://bob:pass123@example.com` these values are
-`http`, `bob` and `pass123`, respectively.
-
+Allows to configure a callback on the anonymized proxy URL for the CONNECT response headers. See the
+above section [Accessing the CONNECT response headers for proxy tunneling](#accessing-the-connect-response-headers-for-proxy-tunneling)
+for details.
 
 ### `redactUrl(url, passwordReplacement)`
 

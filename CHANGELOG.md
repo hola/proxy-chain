@@ -1,3 +1,141 @@
+2.0.1 / 2022-05-02
+==================
+- Simplify code, fix tests, move to TypeScript [#162](https://github.com/apify/proxy-chain/pull/162)
+- Bugfix: Memory leak in createTunnel [#160](https://github.com/apify/proxy-chain/issues/160)
+- Bugfix: Proxy fails to handle non-standard HTTP response in HTTP forwarding mode, on certain websites [#107](https://github.com/apify/proxy-chain/issues/107)
+- Pass proxyChainId to tunnelConnectResponded [#173](https://github.com/apify/proxy-chain/pull/173)
+- feat: accept custom port for proxy anonymization [#214](https://github.com/apify/proxy-chain/pull/214)
+- fix: socket close race condition
+- feat: closeConnection by id [#176](https://github.com/apify/proxy-chain/pull/176)
+- feat: custom dns lookup [#175](https://github.com/apify/proxy-chain/pull/175)
+
+1.0.3 / 2021-08-17
+==================
+- Fixed `EventEmitter` memory leak (see issue [#81](https://github.com/apify/proxy-chain/issues/81))
+- Added automated tests for Node 16
+- Updated dev dependencies
+
+1.0.2 / 2021-04-14
+==================
+- Bugfix: `closeTunnel()` function didn't work because of `runningServers[port].connections.forEach is not a function` error (see issue [#127](https://github.com/apify/proxy-chain/issues/127))
+
+1.0.1 / 2021-04-09
+==================
+ - Bugfix: `parseUrl()` result now always includes port for `http(s)`, `ftp` and `ws(s)` (even if explicitly specified port is the default one)
+   This fixes [#123](https://github.com/apify/proxy-chain/issues/123).
+
+1.0.0 / 2021-03-17
+===================
+- **BREAKING:** The `parseUrl()` function slightly changed its behavior (see README for details):
+  - it no longer returns an object on invalid URLs and throws an exception instead
+  - it URI-decodes username and password if possible
+    (if not, the function keeps the username and password as is)
+  - it adds back `auth` property for better backwards compatibility
+- The above change should make it possible to pass upstream proxy URLs containing
+  special characters, such as `http://user:pass:wrd@proxy.example.com`
+  or `http://us%35er:passwrd@proxy.example.com`. The parsing is done on a best-effort basis.
+  The safest way is to always URI-encode username and password before constructing
+  the URL, according to RFC 3986.
+  This change should finally fix issues:
+  [#89](https://github.com/apify/proxy-chain/issues/89),
+  [#67](https://github.com/apify/proxy-chain/issues/67),
+  and [#108](https://github.com/apify/proxy-chain/issues/108)
+- **BREAKING:** Improved error handling in `createTunnel()` and `prepareRequestFunction()` functions
+  and provided better error messages. Both functions now fail if the upstream proxy
+  URL contains colon (`:`) character in the username, in order to comply with RFC 7617.
+  The functions now fail fast with a reasonable error, rather later and with cryptic errors.
+- **BREAKING:** The `createTunnel()` function now lets the system assign potentially
+  random listening TCP port, instead of the previous selection from range from 20000 to 60000.
+- **BREAKING:** The undocumented `findFreePort()` function was moved from tools.js to test/tools.js
+- Added the [ability to access proxy CONNECT headers](https://github.com/apify/proxy-chain#accessing-the-connect-response-headers-for-proxy-tunneling) for proxy tunneling.
+- Removed dependency on Node.js internal modules, hopefully allowing usage of this library in Electron.
+- Got rid of the "portastic" NPM package and thus reduced bundle size by ~50%
+- Various code improvements and better tests.
+- Updated packages.
+
+0.4.9 / 2021-01-26
+===================
+- Bugfix: Added back the `scheme` field to result from `parseUrl()`
+
+0.4.8 / 2021-01-26
+===================
+- Bugfix: `parseUrl()` function now handles IPv6 and other previously unsupported URLs.
+  Fixes issues [#89](https://github.com/apify/proxy-chain/issues/89)
+  and [#67](https://github.com/apify/proxy-chain/issues/67).
+
+0.4.7 / 2021-01-19
+===================
+- Bugfix: `closeTunnel()` function was returning invalid value.
+  see PR [#98](https://github.com/apify/proxy-chain/pull/101).
+
+0.4.6 / 2020-11-09
+===================
+- `Proxy.Server` now supports `port: 0` option to assign the port randomly,
+   see PR [#98](https://github.com/apify/proxy-chain/pull/98).
+- `anonymizeProxy()` now uses the above port assignment rather than polling for random port => better performance
+- Updated NPM packages
+
+0.4.5 / 2020-05-15
+===================
+- Added checks for closed handlers, in order to prevent the `Cannot read property 'pipe' of null` errors
+  (see issue [#64](https://github.com/apify/proxy-chain/issues/64))
+
+0.4.4 / 2020-03-12
+===================
+- Attempt to fix an unhandled exception in `HandlerTunnelChain.onTrgRequestConnect`
+  (see issue [#64](https://github.com/apify/proxy-chain/issues/64))
+- Code cleanup
+
+0.4.3 / 2020-03-08
+===================
+- Fixed unhandled `TypeError: Cannot read property '_httpMessage' of null` exception
+  in `HandlerTunnelChain.onTrgRequestConnect` (see issue [#63](https://github.com/apify/proxy-chain/issues/63))
+
+0.4.2 / 2020-02-28
+===================
+- Bugfix: Prevented attempted double-sending of certain HTTP responses to client,
+  which might have caused some esoteric errors
+- Error responses now by default have `Content-Type: text/plain; charset=utf-8` instead
+  of `text/html; charset=utf-8` or missing one.
+
+0.4.1 / 2020-02-22
+===================
+- Increased socket end/destroy timeouts from 100ms to 1000ms, to ensure the client
+  receives the data.
+
+0.4.0 / 2020-02-22
+===================
+- **BREAKING CHANGE**: Dropped support for Node.js 9 and lower.
+- BUGFIX: Consume source socket errors to avoid unhandled exceptions.
+  Fixes [Issue #53](https://github.com/apify/proxy-chain/issues/53).
+- BUGFIX: Renamed misspelled `Trailers` HTTP header to `Trailer`.
+- Replaced `bluebird` dependency with native Promises.
+- Upgraded NPM dev dependencies.
+- Fixed broken tests caused by newly introduced strict HTTP parsing in Node.js.
+- Fixed broken test on Node.js 10 by adding `NODE_OPTIONS=--insecure-http-parser` env var to `npm test`.
+
+0.3.3 / 2019-12-27
+===================
+- More informative messages for "Invalid upstreamProxyUrl" errors
+
+0.3.2 / 2019-09-17
+===================
+- Bugfix: Prevent the `"TypeError: hostHeader.startsWith is not a function` error
+  in `HandlerForward` by not forwarding duplicate `Host` headers
+
+0.3.1 / 2019-09-07
+===================
+- **BREAKING CHANGE**: `closeAnonymizedProxy` throws on invalid proxy URL
+- Bugfix: Attempt to prevent the unhandled "write after end" error
+- Bugfix: Proxy no longer attempts to forward invalid
+  HTTP status codes and fails with 500 Internal Server Error
+- Fixed closing of sockets on Node 10+
+- Fixed and improved unit tests to also work on Node 10+, update dev dependencies
+- Changed HTTP 200 message from `Connection established` to `Connection Established`
+  to be according to standards
+- Proxy source/target sockets are set to no delay (i.e. disabled Nagle's algorithm), to avoid any caching delays
+- Improved logging
+
 0.2.7 / 2018-02-19
 ===================
 - Updated README
